@@ -17,7 +17,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install feedparser requests
+      - run: pip install feedparser requests pillow
+      - name: Get heavy font
+        continue-on-error: true
+        run: |
+          mkdir -p fonts
+          curl -fsSL -o fonts/heavy.ttf "https://github.com/google/fonts/raw/main/ofl/archivoblack/ArchivoBlack-Regular.ttf" || rm -f fonts/heavy.ttf
       - run: python bot.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
