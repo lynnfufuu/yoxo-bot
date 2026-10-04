@@ -34,7 +34,7 @@ Then a blank line, then 4-5 short paragraphs of 1-3 sentences each:
 - the key details, or a short direct quote from the source
 - how it unfolded or the timeline, if the source gives one
 - background or context that helps a reader understand it
-- why it matters for the Web3 space (closing paragraph)
+- closing paragraph: what happens next or what to watch, using only what the source says (reactions, deadlines, next steps, open questions). If the source gives none, close with the most relevant remaining detail. Do not force a crypto or Web3 angle that the source does not have.
 Write plainly so anyone gets what the news really means. Use $CASHTAGS for tokens. No hashtags, no emojis, no thread bait.
 RULES: Use ONLY facts in the source. Never invent numbers, quotes or names.
 Keep words like "reportedly" or "alleged". No price predictions or financial advice.
