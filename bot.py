@@ -11,11 +11,13 @@ MODEL = "gemini-2.5-flash"
 MIN_SCORE = 7
 MAX_SCORED = 10
 MAX_DRAFTS = 5
-MAX_AGE_HOURS = 12
+MAX_AGE_HOURS = 24
 
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TG_CHAT = os.environ["TELEGRAM_CHAT_ID"]
+MANUAL = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+errors = []
 
 PROMPT = """You are the editor of @YoXo_Station, a Web3 news account on X.
 Given a news story, do two things.
@@ -43,9 +45,15 @@ STORY:
 
 def load_seen():
     try:
-        return set(json.load(open("seen.json")))
+        data = json.load(open("seen.json"))
+        if isinstance(data, dict):
+            return set(data.get("links", []))
     except Exception:
-        return set()
+        pass
+    return set()
+
+def save_seen(seen):
+    json.dump({"v": 2, "links": sorted(seen)[-2000:]}, open("seen.json", "w"))
 
 def recent(entry):
     t = entry.get("published_parsed")
@@ -62,17 +70,34 @@ def ask_gemini(title, summary, link):
         "generationConfig": {"responseMimeType": "application/json"},
     }
     r = requests.post(url, json=body, timeout=60)
-    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    data = r.json()
+    if "candidates" not in data:
+        raise Exception(f"Gemini {r.status_code}: {str(data)[:300]}")
+    text = data["candidates"][0]["content"]["parts"][0]["text"]
     return json.loads(text)
 
 def send(text):
-    requests.post(
-        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-        json={"chat_id": TG_CHAT, "text": text, "disable_web_page_preview": True},
-        timeout=30,
-    )
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": text, "disable_web_page_preview": True},
+            timeout=30,
+        )
+        if not r.ok:
+            msg = f"Telegram {r.status_code}: {r.text[:200]}"
+            errors.append(msg)
+            print(msg)
+            return False
+        return True
+    except Exception as ex:
+        errors.append(f"Telegram error: {ex}")
+        print("Telegram error:", ex)
+        return False
 
 def main():
+    if MANUAL:
+        send("Bot started. Checking news...")
+
     seen = load_seen()
     new = []
     for feed in FEEDS:
@@ -80,23 +105,37 @@ def main():
             link = e.get("link")
             if link and link not in seen and recent(e):
                 new.append(e)
+    new.sort(key=lambda e: tuple(e.get("published_parsed") or ()), reverse=True)
 
     drafts = 0
+    scores = []
     for e in new[:MAX_SCORED]:
         link = e.link
         try:
             res = ask_gemini(e.get("title", ""), e.get("summary", ""), link)
+            scores.append(res["score"])
             if res["score"] >= MIN_SCORE and drafts < MAX_DRAFTS:
-                send(
+                ok = send(
                     f"Score {res['score']}/10\n\nA:\n{res['post_a']}\n\n"
                     f"B:\n{res['post_b']}\n\nVerify: {res['verify']}\n\nSource: {link}"
                 )
-                drafts += 1
+                if ok:
+                    drafts += 1
+                    seen.add(link)
+            else:
+                seen.add(link)
         except Exception as ex:
+            errors.append(str(ex)[:300])
             print("error:", ex)
-        seen.add(link)
-        time.sleep(5)
+        time.sleep(7)
 
-    json.dump(sorted(seen)[-2000:], open("seen.json", "w"))
+    save_seen(seen)
+
+    if MANUAL:
+        send(
+            f"Run done. New stories: {len(new)}. Scored: {len(scores)}. "
+            f"Scores: {scores}. Drafts sent: {drafts}. "
+            f"Errors: {errors[:3] if errors else 'none'}"
+        )
 
 main()
