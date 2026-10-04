@@ -9,8 +9,8 @@ FEEDS = [
 ]
 MODEL = "gemini-3.8-flash"
 MIN_SCORE = 7
-MAX_SCORED = 10
-MAX_DRAFTS = 5
+MAX_SCORED = 6
+MAX_DRAFTS = 4
 MAX_AGE_HOURS = 24
 
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
@@ -26,19 +26,22 @@ Given a news story, do two things.
 (big numbers, big names, hacks, major launches, regulation, surprising facts score high;
 routine price commentary, sponsored content, and opinion pieces score low).
 
-2) Write two versions of an X post.
+2) Write ONE X post in an extended news style, 900-1300 characters total.
 FORMAT:
 Line 1 (hook): "JUST IN:" or "BREAKING:" + the single most surprising fact, with a number if one exists. ALL CAPS, max 20 words.
-Line 2-3 (details): 1-2 short lines with key numbers, names, or a direct quote from the source.
-Line 4 (optional): one line on why it matters.
-Use $CASHTAGS for tokens. No hashtags, no emojis.
+Then a blank line, then 4-5 short paragraphs of 1-3 sentences each:
+- what happened, with the key numbers and names
+- the key details, or a short direct quote from the source
+- how it unfolded or the timeline, if the source gives one
+- background or context that helps a reader understand it
+- why it matters for the Web3 space (closing paragraph)
+Write plainly so anyone gets what the news really means. Use $CASHTAGS for tokens. No hashtags, no emojis, no thread bait.
 RULES: Use ONLY facts in the source. Never invent numbers, quotes or names.
 Keep words like "reportedly" or "alleged". No price predictions or financial advice.
-Under 280 characters each.
 
 Also give a one-line "verify" note: what the editor should double-check before posting.
 
-Return ONLY JSON: {"score": int, "post_a": str, "post_b": str, "verify": str}
+Return ONLY JSON: {"score": int, "post": str, "verify": str}
 
 STORY:
 """
@@ -64,17 +67,24 @@ def recent(entry):
 
 def ask_gemini(title, summary, link):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={GEMINI_KEY}"
-    story = f"Title: {title}\nSummary: {summary[:1500]}\nLink: {link}"
+    story = f"Title: {title}\nSummary: {summary[:2500]}\nLink: {link}"
     body = {
         "contents": [{"parts": [{"text": PROMPT + story}]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
-    r = requests.post(url, json=body, timeout=60)
-    data = r.json()
-    if "candidates" not in data:
-        raise Exception(f"Gemini {r.status_code}: {str(data)[:300]}")
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(text)
+    last = ""
+    for attempt in range(3):
+        r = requests.post(url, json=body, timeout=60)
+        data = r.json()
+        if "candidates" in data:
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(text)
+        last = f"Gemini {r.status_code}: {str(data)[:200]}"
+        if r.status_code in (429, 500, 503):
+            time.sleep(10 * (attempt + 1))
+            continue
+        break
+    raise Exception(last)
 
 def send(text):
     try:
@@ -116,8 +126,8 @@ def main():
             scores.append(res["score"])
             if res["score"] >= MIN_SCORE and drafts < MAX_DRAFTS:
                 ok = send(
-                    f"Score {res['score']}/10\n\nA:\n{res['post_a']}\n\n"
-                    f"B:\n{res['post_b']}\n\nVerify: {res['verify']}\n\nSource: {link}"
+                    f"Score {res['score']}/10\n\n{res['post']}\n\n"
+                    f"Verify: {res['verify']}\n\nSource: {link}"
                 )
                 if ok:
                     drafts += 1
@@ -127,7 +137,7 @@ def main():
         except Exception as ex:
             errors.append(str(ex)[:300])
             print("error:", ex)
-        time.sleep(7)
+        time.sleep(3)
 
     save_seen(seen)
 
