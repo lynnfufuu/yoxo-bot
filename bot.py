@@ -7,7 +7,7 @@ FEEDS = [
     "https://decrypt.co/feed",
     "https://www.theblock.co/rss.xml",
 ]
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.8-flash"
 MIN_SCORE = 7
 MAX_SCORED = 10
 MAX_DRAFTS = 5
