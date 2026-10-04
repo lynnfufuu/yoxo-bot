@@ -46,6 +46,25 @@ Return ONLY JSON: {"score": int, "post": str, "verify": str}
 STORY:
 """
 
+def list_flash_models():
+    try:
+        r = requests.get(
+            f"https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key={GEMINI_KEY}",
+            timeout=30,
+        )
+        names = []
+        for m in r.json().get("models", []):
+            n = m["name"].split("/")[-1]
+            ok = "generateContent" in m.get("supportedGenerationMethods", [])
+            bad = any(x in n for x in ("image", "tts", "audio", "live", "native", "embedding"))
+            if ok and "flash" in n and not bad:
+                names.append(n)
+        return names
+    except Exception:
+        return []
+
+MODELS = [MODEL] + [n for n in list_flash_models() if n != MODEL][:3]
+
 def load_seen():
     try:
         data = json.load(open("seen.json"))
@@ -66,24 +85,34 @@ def recent(entry):
     return datetime.now(timezone.utc) - dt < timedelta(hours=MAX_AGE_HOURS)
 
 def ask_gemini(title, summary, link):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={GEMINI_KEY}"
     story = f"Title: {title}\nSummary: {summary[:2500]}\nLink: {link}"
     body = {
         "contents": [{"parts": [{"text": PROMPT + story}]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
     last = ""
-    for attempt in range(3):
-        r = requests.post(url, json=body, timeout=60)
-        data = r.json()
-        if "candidates" in data:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text)
-        last = f"Gemini {r.status_code}: {str(data)[:200]}"
-        if r.status_code in (429, 500, 503):
-            time.sleep(10 * (attempt + 1))
-            continue
-        break
+    for model in MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        for attempt in range(2):
+            try:
+                r = requests.post(url, json=body, timeout=60)
+                data = r.json()
+            except Exception as ex:
+                last = f"{model} request error: {str(ex)[:80]}"
+                time.sleep(3)
+                continue
+            if "candidates" in data:
+                try:
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    return json.loads(text)
+                except Exception as ex:
+                    last = f"{model} bad output: {str(ex)[:80]}"
+                    break
+            last = f"{model} {r.status_code}"
+            if r.status_code in (429, 500, 503):
+                time.sleep(4)
+                continue
+            break
     raise Exception(last)
 
 def send(text):
@@ -94,13 +123,13 @@ def send(text):
             timeout=30,
         )
         if not r.ok:
-            msg = f"Telegram {r.status_code}: {r.text[:200]}"
+            msg = f"Telegram {r.status_code}: {r.text[:150]}"
             errors.append(msg)
             print(msg)
             return False
         return True
     except Exception as ex:
-        errors.append(f"Telegram error: {ex}")
+        errors.append(f"Telegram error: {str(ex)[:100]}")
         print("Telegram error:", ex)
         return False
 
@@ -119,10 +148,12 @@ def main():
 
     drafts = 0
     scores = []
+    fails = 0
     for e in new[:MAX_SCORED]:
         link = e.link
         try:
             res = ask_gemini(e.get("title", ""), e.get("summary", ""), link)
+            fails = 0
             scores.append(res["score"])
             if res["score"] >= MIN_SCORE and drafts < MAX_DRAFTS:
                 ok = send(
@@ -135,8 +166,12 @@ def main():
             else:
                 seen.add(link)
         except Exception as ex:
-            errors.append(str(ex)[:300])
+            fails += 1
+            errors.append(str(ex)[:120])
             print("error:", ex)
+            if fails >= 2:
+                errors.append("Stopped early, Gemini busy. Will retry next run.")
+                break
         time.sleep(3)
 
     save_seen(seen)
@@ -145,7 +180,7 @@ def main():
         send(
             f"Run done. New stories: {len(new)}. Scored: {len(scores)}. "
             f"Scores: {scores}. Drafts sent: {drafts}. "
-            f"Errors: {errors[:3] if errors else 'none'}"
+            f"Models: {MODELS}. Errors: {errors[:3] if errors else 'none'}"
         )
 
 main()
