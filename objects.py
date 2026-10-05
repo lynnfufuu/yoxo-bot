@@ -180,4 +180,25 @@ def obj_globe(c, t):
 def obj_wallet(c, t):
     c.rect((96, 60, 276, 160), 16, fill=INDIGO)
     c.rect((44, 112, 356, 336), 38, fill=WHITE)
-    c.rect((44, 112, 356,
+    c.rect((44, 112, 356, 176), 38, fill=LAV)
+    c.rect((232, 214, 356, 278), 30, fill=NAVY)
+    c.ell((258, 232, 298, 272), fill=LIME)
+
+def obj_swap(c, t):
+    c.ell((40, 40, 360, 360), fill=WHITE)
+    c.rect((88, 126, 238, 164), 18, fill=NAVY)
+    c.poly([(232, 92), (232, 198), (312, 145)], NAVY)
+    c.rect((162, 236, 312, 274), 18, fill=INDIGO)
+    c.poly([(168, 202), (168, 308), (88, 255)], INDIGO)
+
+OBJECTS = {"coin": obj_coin, "bank": obj_bank, "shield": obj_shield, "lock": obj_lock,
+           "chart_up": obj_chart_up, "chart_down": obj_chart_down, "gavel": obj_gavel,
+           "rocket": obj_rocket, "chip": obj_chip, "globe": obj_globe, "wallet": obj_wallet, "swap": obj_swap}
+
+def make_object(name, text, fallback_letter="$"):
+    c = Cv()
+    fn = OBJECTS.get(str(name).lower().strip())
+    if fn is None:
+        fn, text = obj_coin, (text or fallback_letter)
+    fn(c, text)
+    return c.im
