@@ -1,18 +1,39 @@
-import os, io, json, time, requests, feedparser
+import os, json, time, re, html, requests, feedparser
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor
 from graphic import render
 
 FEEDS = [
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://cointelegraph.com/rss",
-    "https://decrypt.co/feed",
-    "https://www.theblock.co/rss.xml",
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+    ("Cointelegraph", "https://cointelegraph.com/rss"),
+    ("Decrypt", "https://decrypt.co/feed"),
+    ("The Block", "https://www.theblock.co/rss.xml"),
+    ("Bitcoin Magazine", "https://bitcoinmagazine.com/feed"),
+    ("CryptoSlate", "https://cryptoslate.com/feed/"),
+    ("U.Today", "https://u.today/rss"),
+    ("BeInCrypto", "https://beincrypto.com/feed/"),
+    ("CryptoPotato", "https://cryptopotato.com/feed/"),
+    ("NewsBTC", "https://www.newsbtc.com/feed/"),
+    ("Bitcoinist", "https://bitcoinist.com/feed/"),
+    ("AMBCrypto", "https://ambcrypto.com/feed/"),
+    ("Blockworks", "https://blockworks.co/feed"),
+    ("Crypto Briefing", "https://cryptobriefing.com/feed/"),
+    ("CoinGape", "https://coingape.com/feed/"),
+    ("Cryptonews", "https://cryptonews.com/news/feed/"),
+    ("Protos", "https://protos.com/feed/"),
+    ("Unchained", "https://unchainedcrypto.com/feed/"),
+    ("crypto.news", "https://crypto.news/feed/"),
+    ("DL News", "https://www.dlnews.com/arc/outboundfeeds/rss/"),
+    ("NFT Evening", "https://nftevening.com/feed/"),
+    ("NFT Now", "https://nftnow.com/feed/"),
+    ("Ethereum Foundation", "https://blog.ethereum.org/feed.xml"),
 ]
 MODEL = "gemini-3.8-flash"
-MIN_SCORE = 7
-MAX_SCORED = 6
-MAX_DRAFTS = 4
+MIN_SCORE = 6
+MAX_CANDIDATES = 24
+MAX_DRAFTS = 3
 MAX_AGE_HOURS = 24
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -20,27 +41,36 @@ TG_CHAT = os.environ["TELEGRAM_CHAT_ID"]
 MANUAL = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 errors = []
 
-PROMPT = """You are the editor of @YoXo_Station, a Web3 news account on X.
+SCORE_PROMPT = """You are the news editor of @YoXo_Station, an X account about Web3: crypto, blockchain, NFTs, DeFi, stablecoins, exchanges, tokenization, Web3 gaming, AI x crypto, and regulation that affects them.
+You get NEW STORIES (id | source | title | snippet) and RECENT POSTS that were already sent.
+
+For EVERY story return:
+- "score" 1-10 = how likely people are to read and share it as a Web3 post.
+  8-10: hacks or exploits with big numbers, major launches, big institutions moving in or out, regulation decisions, record numbers, big names, surprising facts.
+  5-7: solid news with moderate impact.
+  1-4: routine price commentary, sponsored or promoted content, opinion pieces, how-to guides, listicles, or anything NOT related to Web3.
+- "dup" = true if the story reports the same news event as any RECENT POST, or as another story earlier in the list. If several stories cover one event, keep dup=false only on the best one.
+
+Return ONLY JSON: [{"id": int, "score": int, "dup": bool}, ...] with one item per story.
+
+"""
+
+WRITE_PROMPT = """You are the editor of @YoXo_Station, a Web3 news account on X.
 Given a news story, do three things.
 
-1) Score 1-10 how likely people are to actually read and share it
-(big numbers, big names, hacks, major launches, regulation, surprising facts score high;
-routine price commentary, sponsored content, and opinion pieces score low).
-
-2) Write ONE X post in an extended news style, 900-1300 characters total.
+1) Write ONE X post, 450-750 characters total, built to be skimmed in seconds.
 FORMAT:
-Line 1 (hook): "JUST IN:" or "BREAKING:" + the single most surprising fact, with a number if one exists. ALL CAPS, max 20 words.
-Then a blank line, then 4-5 short paragraphs of 1-3 sentences each:
-- what happened, with the key numbers and names
-- the key details, or a short direct quote from the source
-- how it unfolded or the timeline, if the source gives one
-- background or context that helps a reader understand it
-- closing paragraph: what happens next or what to watch, using only what the source says (reactions, deadlines, next steps, open questions). If the source gives none, close with the most relevant remaining detail. Do not force a crypto or Web3 angle that the source does not have.
-Write plainly so anyone gets what the news really means. Use $CASHTAGS for tokens. No hashtags, no emojis, no thread bait.
+Line 1 (hook): "JUST IN:" or "BREAKING:" + the single most surprising fact, with a number if one exists. ALL CAPS, max 18 words.
+Then a blank line, then 3-4 short lines, one sentence each (max 22 words), separated by blank lines:
+- the key stat or number, with the names involved
+- the most important detail, or a short direct quote from the source
+- one more detail that adds context (skip it if the source has none)
+- last line: what happens next or what to watch, only if the source says it; otherwise a sharp one-line takeaway built only from facts in the source.
+Plain words, no filler. Use $CASHTAGS for tokens. No hashtags, no emojis, no thread bait.
 RULES: Use ONLY facts in the source. Never invent numbers, quotes or names.
 Keep words like "reportedly" or "alleged". No price predictions or financial advice.
 
-3) Fill in the text for a bold square social media graphic ("graphic"):
+2) Fill in the text for a bold square social media graphic ("graphic"):
 - kicker: 1-3 words naming the topic or project (example: "Near Intents")
 - headline: max 8 words, punchy, states the news. Do NOT repeat the big_number in it.
 - highlight: ONE word copied exactly from your headline that deserves emphasis.
@@ -58,13 +88,67 @@ Keep words like "reportedly" or "alleged". No price predictions or financial adv
 - object_text: if object is "coin", the token's ticker, max 4 letters (examples: "BTC", "ETH", "SOL", "USDT"). If object is "chip", a 2-3 letter label like "AI" or "GPU". Otherwise "".
 Everything in the graphic must come from the source. Never invent anything.
 
-Also give a one-line "verify" note: what the editor should double-check before posting.
+3) Give a one-line "verify" note: what the editor should double-check before posting.
 
 Return ONLY JSON:
-{"score": int, "post": str, "verify": str, "graphic": {"kicker": str, "headline": str, "highlight": str, "big_number": str, "number_label": str, "tiles": [{"value": str, "label": str}], "tag": str, "source": str, "object": str, "object_text": str}}
+{"post": str, "verify": str, "graphic": {"kicker": str, "headline": str, "highlight": str, "big_number": str, "number_label": str, "tiles": [{"value": str, "label": str}], "tag": str, "source": str, "object": str, "object_text": str}}
 
 STORY:
 """
+
+STOP = set("a an the of to in on for and or as at by with from is are be after before over into new says say report reports will its it this that than more".split())
+
+def toks(s):
+    return set(w for w in re.findall(r"[a-z0-9$%.]+", s.lower()) if w not in STOP and len(w) > 2)
+
+def similar(a, b):
+    ta, tb = toks(a), toks(b)
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / len(ta | tb) >= 0.5
+
+def clean_html(s):
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", s or ""))).strip()
+
+def mm_time(entry):
+    t = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not t:
+        return ""
+    dt = datetime(*t[:6], tzinfo=timezone.utc) + timedelta(hours=6, minutes=30)
+    h = dt.hour % 12 or 12
+    ap = "AM" if dt.hour < 12 else "PM"
+    return "Published: " + str(dt.day) + " " + dt.strftime("%b %Y") + ", " + str(h) + ":" + format(dt.minute, "02d") + " " + ap + " (Myanmar time)"
+
+def load_state():
+    try:
+        data = json.load(open("seen.json"))
+        if isinstance(data, dict):
+            return (set(data.get("links", [])), int(data.get("n", 0)),
+                    list(data.get("titles", [])), list(data.get("sent", [])))
+    except Exception:
+        pass
+    return set(), 0, [], []
+
+def save_state(seen, n, titles, sent):
+    json.dump({"v": 4, "n": n, "links": sorted(seen)[-3000:], "titles": titles[-250:], "sent": sent[-30:]},
+              open("seen.json", "w"))
+
+def recent(entry):
+    t = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not t:
+        return True
+    dt = datetime(*t[:6], tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - dt < timedelta(hours=MAX_AGE_HOURS)
+
+def fetch_feed(item):
+    name, url = item
+    try:
+        r = requests.get(url, headers=UA, timeout=15)
+        if r.ok:
+            return name, feedparser.parse(r.content).entries
+    except Exception:
+        pass
+    return name, []
 
 def list_flash_models():
     try:
@@ -85,29 +169,9 @@ def list_flash_models():
 
 MODELS = [MODEL] + [n for n in list_flash_models() if n != MODEL][:3]
 
-def load_seen():
-    try:
-        data = json.load(open("seen.json"))
-        if isinstance(data, dict):
-            return set(data.get("links", []))
-    except Exception:
-        pass
-    return set()
-
-def save_seen(seen):
-    json.dump({"v": 2, "links": sorted(seen)[-2000:]}, open("seen.json", "w"))
-
-def recent(entry):
-    t = entry.get("published_parsed")
-    if not t:
-        return True
-    dt = datetime(*t[:6], tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) - dt < timedelta(hours=MAX_AGE_HOURS)
-
-def ask_gemini(title, summary, link):
-    story = f"Title: {title}\nSummary: {summary[:2500]}\nLink: {link}"
+def gemini(text):
     body = {
-        "contents": [{"parts": [{"text": PROMPT + story}]}],
+        "contents": [{"parts": [{"text": text}]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
     last = ""
@@ -115,7 +179,7 @@ def ask_gemini(title, summary, link):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
         for attempt in range(2):
             try:
-                r = requests.post(url, json=body, timeout=60)
+                r = requests.post(url, json=body, timeout=90)
                 data = r.json()
             except Exception as ex:
                 last = f"{model} request error: {str(ex)[:80]}"
@@ -123,8 +187,7 @@ def ask_gemini(title, summary, link):
                 continue
             if "candidates" in data:
                 try:
-                    text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    return json.loads(text)
+                    return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
                 except Exception as ex:
                     last = f"{model} bad output: {str(ex)[:80]}"
                     break
@@ -139,18 +202,15 @@ def send(text):
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": text, "disable_web_page_preview": True},
+            json={"chat_id": TG_CHAT, "text": text[:4000], "disable_web_page_preview": True},
             timeout=30,
         )
         if not r.ok:
-            msg = f"Telegram {r.status_code}: {r.text[:150]}"
-            errors.append(msg)
-            print(msg)
+            errors.append(f"Telegram {r.status_code}: {r.text[:150]}")
             return False
         return True
     except Exception as ex:
         errors.append(f"Telegram error: {str(ex)[:100]}")
-        print("Telegram error:", ex)
         return False
 
 def send_photo(png):
@@ -172,55 +232,96 @@ def main():
     if MANUAL:
         send("Bot started. Checking news...")
 
-    seen = load_seen()
-    new = []
-    for feed in FEEDS:
-        for e in feedparser.parse(feed).entries:
+    seen, n, titles, sent = load_state()
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(fetch_feed, FEEDS))
+    ok_feeds = [name for name, ents in results if ents]
+    broken = [name for name, ents in results if not ents]
+
+    pool = []
+    for name, ents in results:
+        for e in ents:
             link = e.get("link")
-            if link and link not in seen and recent(e):
-                new.append(e)
-    new.sort(key=lambda e: tuple(e.get("published_parsed") or ()), reverse=True)
+            title = clean_html(e.get("title", ""))
+            if link and title and link not in seen and recent(e):
+                pool.append({"source": name, "title": title, "link": link,
+                             "summary": clean_html(e.get("summary", "")), "entry": e})
+    pool.sort(key=lambda c: tuple(c["entry"].get("published_parsed") or c["entry"].get("updated_parsed") or ()), reverse=True)
 
-    drafts = 0
-    scores = []
-    fails = 0
-    for e in new[:MAX_SCORED]:
-        link = e.link
+    # cheap duplicate filter: same story already processed, or covered by another outlet in this batch
+    cands, skipped_dups = [], 0
+    for c in pool:
+        if any(similar(c["title"], t) for t in titles) or any(similar(c["title"], k["title"]) for k in cands):
+            seen.add(c["link"])
+            skipped_dups += 1
+            continue
+        if len(cands) < MAX_CANDIDATES:
+            cands.append(c)
+
+    drafts, picked, dups, scores = 0, [], 0, []
+    if cands:
         try:
-            res = ask_gemini(e.get("title", ""), e.get("summary", ""), link)
-            fails = 0
-            scores.append(res["score"])
-            if res["score"] >= MIN_SCORE and drafts < MAX_DRAFTS:
-                try:
-                    png = render(res.get("graphic") or {})
-                    send_photo(png)
-                except Exception as ex:
-                    errors.append(f"Graphic error: {str(ex)[:100]}")
-                ok = send(
-                    f"Score {res['score']}/10\n\n{res['post']}\n\n"
-                    f"Verify: {res['verify']}\n\nSource: {link}"
-                )
-                if ok:
-                    drafts += 1
-                    seen.add(link)
-            else:
-                seen.add(link)
+            lines = [f"{i} | {c['source']} | {c['title']} | {c['summary'][:220]}" for i, c in enumerate(cands)]
+            recent_txt = "\n".join("- " + t for t in sent[-15:]) or "(none)"
+            res = gemini(SCORE_PROMPT + "RECENT POSTS ALREADY SENT:\n" + recent_txt + "\n\nNEW STORIES:\n" + "\n".join(lines))
+            if isinstance(res, dict):
+                res = next((v for v in res.values() if isinstance(v, list)), [])
+            by_id = {int(r["id"]): r for r in res if isinstance(r, dict) and "id" in r}
         except Exception as ex:
-            fails += 1
-            errors.append(str(ex)[:120])
-            print("error:", ex)
-            if fails >= 2:
-                errors.append("Stopped early, Gemini busy. Will retry next run.")
-                break
-        time.sleep(3)
+            errors.append("Scoring failed: " + str(ex)[:120])
+            by_id = None
 
-    save_seen(seen)
+        if by_id is not None:
+            for i, c in enumerate(cands):
+                r = by_id.get(i, {})
+                c["score"] = int(r.get("score", 0) or 0)
+                c["dup"] = bool(r.get("dup", False))
+                scores.append(c["score"])
+                dups += 1 if c["dup"] else 0
+            picked = [c for c in cands if c["score"] >= MIN_SCORE and not c["dup"]]
+            picked.sort(key=lambda c: -c["score"])
+            picked = picked[:MAX_DRAFTS]
+            unsent = set(c["link"] for c in picked)
+            fails = 0
+            for c in picked:
+                try:
+                    out = gemini(WRITE_PROMPT + f"Source: {c['source']}\nTitle: {c['title']}\nSummary: {c['summary'][:2500]}\nLink: {c['link']}")
+                    fails = 0
+                    g = out.get("graphic") or {}
+                    try:
+                        png = render(g, variant=n)
+                        n += 1
+                        send_photo(png)
+                    except Exception as ex:
+                        errors.append("Graphic error: " + str(ex)[:100])
+                    post = str(out.get("post", "")).rstrip()
+                    stamp = mm_time(c["entry"])
+                    if stamp:
+                        post = post + "\n\n" + stamp
+                    if send(f"Score {c['score']}/10\n\n{post}\n\nVerify: {out.get('verify', '')}\n\nSource: {c['link']}"):
+                        drafts += 1
+                        unsent.discard(c["link"])
+                        sent.append(str(g.get("headline") or c["title"]))
+                except Exception as ex:
+                    errors.append(str(ex)[:120])
+                    fails += 1
+                    if fails >= 2:
+                        errors.append("Stopped early, Gemini busy. Will retry next run.")
+                        break
+                time.sleep(2)
+            for c in cands:
+                if c["link"] not in unsent:
+                    seen.add(c["link"])
+                    titles.append(c["title"])
+
+    save_state(seen, n, titles, sent)
 
     if MANUAL:
         send(
-            f"Run done. New stories: {len(new)}. Scored: {len(scores)}. "
-            f"Scores: {scores}. Drafts sent: {drafts}. "
-            f"Errors: {errors[:3] if errors else 'none'}"
+            f"Run done. Feeds working: {len(ok_feeds)}/{len(FEEDS)}. Not working: {', '.join(broken) if broken else 'none'}. "
+            f"New stories: {len(pool)}. Duplicates skipped: {skipped_dups + dups}. Scored: {len(scores)}. "
+            f"Scores: {scores}. Sent: {drafts}. Errors: {errors[:3] if errors else 'none'}"
         )
 
 main()
