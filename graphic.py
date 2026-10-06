@@ -1,29 +1,96 @@
-import io
+import io, colorsys
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from objects import *
 
-PALETTES = [
-    {"name": "indigo", "bg": [(56, 44, 210), (88, 72, 228), (224, 220, 252)], "head": WHITE, "hl_fill": LIME, "hl_text": NAVY,
-     "card": WHITE, "card_text": NAVY, "card_muted": MUTED, "via_fill": LIME, "via_text": NAVY, "disc": LIME,
-     "blob1": LIME, "blob2": (171, 224, 20), "pill_text": WHITE, "pill_line": WHITE, "pill_fill": (255, 255, 255, 46),
-     "st_fill": NAVY, "st_text": LIME, "foot": (70, 56, 214), "foot_text": WHITE, "logo_fill": LIME, "logo_text": NAVY,
-     "num": WHITE, "label": (225, 222, 255)},
-    {"name": "lime", "bg": [(201, 243, 29), (214, 248, 70), (236, 252, 160)], "head": NAVY, "hl_fill": INDIGO, "hl_text": WHITE,
-     "card": WHITE, "card_text": NAVY, "card_muted": MUTED, "via_fill": NAVY, "via_text": LIME, "disc": INDIGO,
-     "blob1": INDIGO, "blob2": NAVY, "pill_text": NAVY, "pill_line": NAVY, "pill_fill": (255, 255, 255, 90),
-     "st_fill": NAVY, "st_text": LIME, "foot": NAVY, "foot_text": WHITE, "logo_fill": LIME, "logo_text": NAVY,
-     "num": NAVY, "label": (50, 46, 120)},
-    {"name": "navy", "bg": [(14, 11, 74), (40, 30, 150), (88, 72, 228)], "head": WHITE, "hl_fill": LIME, "hl_text": NAVY,
-     "card": WHITE, "card_text": NAVY, "card_muted": MUTED, "via_fill": LIME, "via_text": NAVY, "disc": LIME,
-     "blob1": INDIGO, "blob2": LIME, "pill_text": WHITE, "pill_line": LAV2, "pill_fill": (255, 255, 255, 30),
-     "st_fill": LIME, "st_text": NAVY, "foot": (255, 255, 255), "foot_text": NAVY, "logo_fill": NAVY, "logo_text": LIME,
-     "num": LIME, "label": (200, 196, 250)},
-    {"name": "light", "bg": [(247, 245, 255), (236, 233, 255), (214, 209, 250)], "head": NAVY, "hl_fill": LIME, "hl_text": NAVY,
-     "card": INDIGO, "card_text": WHITE, "card_muted": (214, 209, 250), "via_fill": LIME, "via_text": NAVY, "disc": LIME,
-     "blob1": LIME, "blob2": LAV2, "pill_text": NAVY, "pill_line": NAVY, "pill_fill": (255, 255, 255, 120),
-     "st_fill": NAVY, "st_text": LIME, "foot": NAVY, "foot_text": WHITE, "logo_fill": LIME, "logo_text": NAVY,
-     "num": INDIGO, "label": MUTED},
-]
+def hls(h, l, s):
+    r, g, b = colorsys.hls_to_rgb(h % 1.0, max(0.0, min(1.0, l)), max(0.0, min(1.0, s)))
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+def lum(c):
+    def f(v):
+        v = v / 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    return 0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2])
+
+def contrast(a, b):
+    la, lb = lum(a), lum(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+def best_text(bgc, ink):
+    return WHITE if contrast(WHITE, bgc) >= contrast(ink, bgc) else ink
+
+OFFS = [0.5, 0.333, 0.667, 0.417, 0.583, 0.25]
+
+def pick_pop(ha, ink):
+    for L in (0.58, 0.64, 0.70, 0.76, 0.82):
+        c = hls(ha, L, 1.0)
+        if contrast(ink, c) >= 6.0:
+            return c
+    return hls(ha, 0.82, 1.0)
+
+def pick_disc(ha, bgbot):
+    fallback = None
+    for L in (0.50, 0.44, 0.56, 0.38, 0.62, 0.32, 0.68):
+        c = hls(ha, L, 0.95)
+        if 0.20 <= lum(c) <= 0.42:
+            if contrast(c, bgbot) >= 1.25:
+                return c
+            if fallback is None:
+                fallback = c
+    return fallback or hls(ha, 0.5, 0.95)
+
+def make_palette(k):
+    h = (0.07 + k * 0.381966) % 1.0
+    ha = (h + OFFS[(k // 3 + k) % len(OFFS)]) % 1.0
+    mode = ["dark", "light", "vivid"][k % 3]
+    ink, rim = hls(h, 0.12, 0.55), hls(h, 0.22, 0.6)
+    mid, tint, tint2 = hls(h, 0.40, 0.72), hls(h, 0.93, 0.75), hls(h, 0.80, 0.65)
+    pop = pick_pop(ha, ink)
+    muted = hls(h, 0.40, 0.45)
+    if mode == "vivid":
+        bgs = [hls(h, 0.44, 0.85), hls(h, 0.50, 0.88), hls(h, 0.58, 0.85)]
+        tw_ = min(contrast(WHITE, b) for b in bgs)
+        ti_ = min(contrast(ink, b) for b in bgs)
+        if max(tw_, ti_) < 3.4:
+            mode = "dark"
+    if mode == "dark":
+        bgs = [hls(h, 0.10, 0.65), hls(h, 0.19, 0.7), hls(h, 0.32, 0.7)]
+    elif mode == "light":
+        bgs = [hls(h, 0.97, 0.7), hls(h, 0.93, 0.7), hls(h, 0.85, 0.6)]
+    if mode == "vivid":
+        head = WHITE if min(contrast(WHITE, b) for b in bgs) >= min(contrast(ink, b) for b in bgs) else ink
+    else:
+        head = WHITE if mode == "dark" else ink
+    disc = pick_disc(ha, bgs[2])
+    p = {"mode": mode, "bg": bgs, "head": head, "ink": ink, "rim": rim, "mid": mid, "tint": tint, "tint2": tint2,
+         "pop": pop, "disc": disc, "muted": muted, "hl_fill": pop, "hl_text": best_text(pop, ink)}
+    if mode == "light":
+        L = 0.36
+        card = hls(h, L, 0.75)
+        while contrast(WHITE, card) < 5.0 and L > 0.16:
+            L -= 0.02
+            card = hls(h, L, 0.75)
+        p.update(card=card, card_text=WHITE, card_muted=tint, via_fill=pop, via_text=best_text(pop, ink),
+                 blob1=pop, blob2=tint2, pill_text=ink, pill_line=ink, pill_fill=(255, 255, 255, 120),
+                 st_fill=ink, st_text=pop, foot=ink, foot_text=WHITE, logo_fill=pop, logo_text=best_text(pop, ink),
+                 num=card, label=muted)
+    elif mode == "dark":
+        p.update(card=WHITE, card_text=ink, card_muted=muted, via_fill=pop, via_text=best_text(pop, ink),
+                 blob1=hls(h, 0.45, 0.75), blob2=pop, pill_text=WHITE, pill_line=tint2, pill_fill=(255, 255, 255, 30),
+                 st_fill=pop, st_text=best_text(pop, ink), foot=WHITE, foot_text=ink, logo_fill=ink, logo_text=pop,
+                 num=pop, label=tint2)
+    else:
+        p.update(card=WHITE, card_text=ink, card_muted=muted, via_fill=ink, via_text=pop,
+                 blob1=hls(h, 0.30, 0.8), blob2=pop, pill_text=head, pill_line=head, pill_fill=(255, 255, 255, 40),
+                 hl_fill=ink, hl_text=pop,
+                 st_fill=ink, st_text=pop, foot=ink, foot_text=WHITE, logo_fill=pop, logo_text=best_text(pop, ink),
+                 num=head, label=head)
+    return p
+
+CUR = {"ink": (14, 11, 74)}
+
+def sh(img, box, r, **kw):
+    shadow(img, box, r, color=CUR["ink"], **kw)
 
 def bg(pal):
     a, b, c = pal["bg"]
@@ -130,7 +197,7 @@ def sticker(img, text, cx, cy, r, angle, pal):
 
 def footer(img, pal):
     fy0, fy1, x0, x1 = P(986), P(1040), P(64), P(1016)
-    shadow(img, (x0, fy0, x1, fy1), P(27), blur=12, dy=6, alpha=60)
+    sh(img, (x0, fy0, x1, fy1), P(27), blur=12, dy=6, alpha=60)
     rr(img, (x0, fy0, x1, fy1), P(27), pal["foot"] + (245,))
     d = ImageDraw.Draw(img)
     d.ellipse((x0 + P(12), fy0 + P(9), x0 + P(48), fy0 + P(45)), fill=pal["logo_fill"])
@@ -142,16 +209,24 @@ def footer(img, pal):
 def blob(img, pal, cx, cy, r, key):
     ImageDraw.Draw(img).ellipse((P(cx - r), P(cy - r), P(cx + r), P(cy + r)), fill=pal[key])
 
+def initials(s):
+    words = [w for w in "".join(ch if ch.isalnum() else " " for ch in (s or "")).split() if w]
+    if not words:
+        return "W3"
+    if len(words) == 1:
+        return words[0][:2].upper()
+    return (words[0][0] + words[1][0]).upper()
+
 def hero(img, g, kicker, cx, cy, rd, pal, angle=-5):
     d = ImageDraw.Draw(img)
     d.ellipse((P(cx - rd), P(cy - rd), P(cx + rd), P(cy + rd)), fill=pal["disc"])
-    obj = make_object(g.get("object"), g.get("object_text"), (kicker[:1] or "$"))
+    obj = make_object(g.get("object"), g.get("object_text"), initials(kicker))
     k = (2 * rd * 1.04) / 400.0
     obj = obj.resize((int(obj.width * k), int(obj.height * k)), Image.LANCZOS)
     obj = obj.rotate(angle, expand=True, resample=Image.BICUBIC)
-    sh = obj.split()[3].point(lambda v: int(v * 0.28)).filter(ImageFilter.GaussianBlur(P(10) * k))
+    shd = obj.split()[3].point(lambda v: int(v * 0.28)).filter(ImageFilter.GaussianBlur(P(10) * k))
     ox, oy = P(cx) - obj.width // 2, P(cy) - obj.height // 2
-    img.paste(Image.new("RGB", obj.size, NAVY), (ox, oy + P(14)), sh)
+    img.paste(Image.new("RGB", obj.size, CUR["ink"]), (ox, oy + P(14)), shd)
     img.paste(obj, (ox, oy), obj)
 
 def via_pill(img, x, y, source, pal):
@@ -176,12 +251,12 @@ def stat_chip(img, cx, cy, tile, pal, angle=5):
     fv = font(HEAVY, P(44))
     while tw(cd, v, fv) > cw - P(28) and fv.size > P(20):
         fv = font(HEAVY, fv.size - 2)
-    cd.text((cw / 2, ch * 0.40), v, font=fv, fill=NAVY, anchor="mm")
+    cd.text((cw / 2, ch * 0.40), v, font=fv, fill=pal["ink"], anchor="mm")
     flb = font(REG, P(18))
     while tw(cd, lb, flb) > cw - P(20) and flb.size > P(11):
         flb = font(REG, flb.size - 1)
-    cd.text((cw / 2, ch * 0.78), lb, font=flb, fill=MUTED, anchor="mm")
-    shadow(img, (P(cx) - cw // 2, P(cy) - ch // 2, P(cx) + cw // 2, P(cy) + ch // 2), P(26), blur=14, dy=10, alpha=90)
+    cd.text((cw / 2, ch * 0.78), lb, font=flb, fill=pal["muted"], anchor="mm")
+    sh(img, (P(cx) - cw // 2, P(cy) - ch // 2, P(cx) + cw // 2, P(cy) + ch // 2), P(26), blur=14, dy=10, alpha=90)
     paste_rot(img, chip, P(cx), P(cy), angle)
 
 def fit_text(d, s, paths, start, max_w, minimum):
@@ -208,7 +283,7 @@ def stat_card(img, x0, x1, bottom, number, label, kicker, source, pal, with_via=
     gap = P(24) if with_via else 0
     h = P(34) + asc + desc + P(20) + int(fl.size * 0.9) + gap + pill_h + P(34)
     top = P(bottom) - h
-    shadow(img, (P(x0), top, P(x1), P(bottom)), P(36), blur=24, dy=16, alpha=95)
+    sh(img, (P(x0), top, P(x1), P(bottom)), P(36), blur=24, dy=16, alpha=95)
     rr(img, (P(x0), top, P(x1), P(bottom)), P(36), pal["card"] + (255,))
     d = ImageDraw.Draw(img)
     gy = top + P(34) + asc
@@ -281,7 +356,7 @@ def layout_poster(img, g, c, pal):
     y0 = (bh - total) / 2
     bd.text((bw / 2 - wid / 2, y0 + asc), main, font=f, fill=pal["card_text"], anchor="ls")
     bd.text((bw / 2, y0 + asc + desc + P(10) + fl.size * 0.8), lab, font=fl, fill=pal["card_muted"], anchor="mm")
-    shadow(img, (P(110), P(500), P(110) + bw, P(500) + bh), P(34), blur=18, dy=12, alpha=90)
+    sh(img, (P(110), P(500), P(110) + bw, P(500) + bh), P(34), blur=18, dy=12, alpha=90)
     paste_rot(img, badge, P(262), P(585), 6)
     if c["tile"]:
         stat_chip(img, 836, 598, c["tile"], pal, -6)
@@ -291,7 +366,9 @@ def layout_poster(img, g, c, pal):
 
 def render(g, variant=0, out_path=None):
     lay = variant % 4
-    pal = PALETTES[(variant * 3 + variant // 4) % 4]
+    pal = make_palette(variant)
+    CUR["ink"] = pal["ink"]
+    set_colors(pal["ink"], pal["pop"], pal["rim"], pal["mid"], pal["tint"], pal["tint2"])
     hw = str(g.get("headline", "")).upper().split()
     hs = ""
     for w_ in hw:
