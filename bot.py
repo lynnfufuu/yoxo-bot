@@ -1,4 +1,4 @@
-import os, json, time, re, html, requests, feedparser
+import os, json, time, re, html, calendar, requests, feedparser
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -68,8 +68,10 @@ NICHE = {"NFT Evening", "NFT Now", "NFT Plazas", "NFTgators", "DappRadar", "Meme
 MODEL = "gemini-3.8-flash"
 MIN_SCORE = 5
 MAX_CANDIDATES = 60
-MAX_DRAFTS = 5
-CAT_CAP = 2
+MAX_DRAFTS = 6
+GENERAL_MAX = 2
+PRIORITY = ["nft", "meme", "listing", "launch", "token", "trader", "scam"]
+CG_KEY = os.environ.get("COINGECKO_KEY", "").strip()
 MAX_AGE_HOURS = 24
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
@@ -87,7 +89,8 @@ For EVERY story return:
   8-10: hacks, exploits, rug pulls or scams with big numbers; major exchange listings (Binance, Coinbase, Upbit, Bybit, OKX, Bithumb, Robinhood); big launches (launchpads, perp DEXs, testnet or mainnet going live, airdrops); hyped NFT collections or mints; trending memecoins; big whale or trader moves; big institutions moving in or out; regulation decisions; record numbers; big names.
   6-7: genuine news in the niche categories (listing, launch, nft, meme, trader, token, scam) even if smaller. Give these at least 6 unless sponsored or purely promotional.
   4-5: solid but low-impact general news.
-  1-3: routine price commentary, sponsored or promoted content, opinion pieces, how-to guides, listicles, or anything NOT related to Web3.
+  1-3: price predictions and technical-analysis articles, sponsored or promoted content, opinion pieces, how-to guides, listicles, or anything NOT related to Web3.
+  DATA ALERTS (items whose source is CoinGecko or DexScreener: price moves, NFT floor moves, trending or new tokens) are real news. Score them by size and substance: NFT floor move of 30% or more = 7; memecoin or small token move of 100% or more with real liquidity = 7; new token with real liquidity = 6; top-100 coin move of 10% or more = 6; tiny moves or illiquid tokens = 4.
 - "cat" = one of: listing, launch, nft, meme, scam, trader, token, regulation, market, other.
 - "dup" = true if the story reports the same news event as any RECENT POST, or as another story earlier in the list. If several stories cover one event, keep dup=false only on the best one. Different tokens or projects are different events, even if the headline wording is similar.
 
@@ -130,6 +133,7 @@ RULES: Use ONLY facts in the source. Never invent numbers, quotes or names.
 Keep words like "reportedly" or "alleged". No price predictions or financial advice.
 No guessing about what it could mean for price, adoption or market perception unless the source quotes someone saying it.
 If the snippet is only a headline, write a shorter post (hook plus 2 lines) from the facts in it.
+If the story is a data alert (price move, NFT floor move, trending or new token), write it from the numbers only: hook with the move and the number, then lines with the price, 24h and 1h change, volume, liquidity or floor price, whichever are given. For small DEX tokens add one line saying it is high-risk when liquidity is under $250K. No predictions, no advice to buy or sell.
 
 2) """ + GRAPHIC_SPEC + """
 
@@ -223,7 +227,7 @@ def mm_time(entry):
     return "Published: " + fmt_mm(datetime(*t[:6], tzinfo=timezone.utc) + timedelta(hours=6, minutes=30))
 
 def load_state():
-    st = {"links": [], "n": 0, "titles": [], "sent": [], "objs": [], "mint_day": "", "mint_tries": 0, "mint_done": False}
+    st = {"links": [], "n": 0, "titles": [], "sent": [], "objs": [], "mint_day": "", "mint_tries": 0, "mint_done": False, "queue": [], "rr": 0}
     try:
         data = json.load(open("seen.json"))
         if isinstance(data, dict):
@@ -240,6 +244,7 @@ def save_state(st):
     out["titles"] = st["titles"][-400:]
     out["sent"] = st["sent"][-30:]
     out["objs"] = st["objs"][-10:]
+    out["queue"] = st["queue"][:60]
     json.dump(out, open("seen.json", "w"))
 
 def age_ok(entry, hours):
@@ -344,6 +349,19 @@ def list_flash_models():
 
 MODELS = [MODEL] + [n for n in list_flash_models() if n != MODEL][:3]
 
+def parse_json(text):
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+    for cand in (t, re.sub(r",\s*([}\]])", r"\1", t)):
+        try:
+            return json.loads(cand)
+        except Exception:
+            pass
+    t2 = re.sub(r",\s*([}\]])", r"\1", t)
+    m = re.search(r"(\{.*\}|\[.*\])", t2, re.S)
+    if m:
+        return json.loads(m.group(1))
+    raise ValueError("no valid JSON")
+
 def gemini(text):
     body = {
         "contents": [{"parts": [{"text": text}]}],
@@ -362,7 +380,7 @@ def gemini(text):
                 continue
             if "candidates" in data:
                 try:
-                    return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+                    return parse_json(data["candidates"][0]["content"]["parts"][0]["text"])
                 except Exception as ex:
                     last = f"{model} bad output: {str(ex)[:80]}"
                     break
@@ -423,6 +441,208 @@ def daily_mints(st, nft_items):
         errors.append("Mint list: " + str(ex)[:100])
     return 0
 
+def money(v):
+    try:
+        v = float(v)
+    except Exception:
+        return str(v)
+    if v >= 1000:
+        return f"${v:,.0f}"
+    if v >= 1:
+        return f"${v:,.2f}"
+    if v >= 0.01:
+        return f"${v:.4f}"
+    return "$" + f"{v:.8f}".rstrip("0")
+
+def big(v):
+    try:
+        v = float(v)
+    except Exception:
+        return "n/a"
+    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if abs(v) >= div:
+            return f"${v / div:.1f}{unit}"
+    return f"${v:.0f}"
+
+def mk(feed, source, title, summary, link):
+    return {"feed": feed, "source": source, "title": title, "link": link, "summary": summary,
+            "entry": {"published_parsed": time.gmtime()}}
+
+def cg_get(path):
+    headers = {"accept": "application/json", "User-Agent": UA["User-Agent"]}
+    if CG_KEY:
+        headers["x-cg-demo-api-key"] = CG_KEY
+    return requests.get("https://api.coingecko.com/api/v3" + path, headers=headers, timeout=20)
+
+def data_items():
+    """Real price, NFT floor and new-token data, turned into news items."""
+    items, status = [], {}
+    day = mm_now().strftime("%Y%m%d")
+    try:
+        r = cg_get("/search/trending")
+        status["cg-trending"] = "ok" if r.ok else "http " + str(r.status_code)
+        j = r.json() if r.ok else {}
+        n_nft = 0
+        for n in (j.get("nfts") or [])[:7]:
+            try:
+                pct = float(n.get("floor_price_24h_percentage_change"))
+            except Exception:
+                continue
+            if abs(pct) < 8 or n_nft >= 5:
+                continue
+            n_nft += 1
+            d = n.get("data") or {}
+            sym = n.get("native_currency_symbol", "ETH")
+            floor = n.get("floor_price_in_native_currency")
+            way = "up" if pct > 0 else "down"
+            title = f"{n.get('name', 'NFT collection')} NFT floor {way} {abs(pct):.0f}% in 24h" + (f" to {round(float(floor), 3)} {sym}" if floor is not None else "")
+            summary = (f"CoinGecko trending NFT collection. Floor price {floor} {sym}. 24h floor change {pct:+.1f}%. "
+                       f"24h volume {d.get('h24_volume', 'n/a')}. Average sale price {d.get('h24_average_sale_price', 'n/a')}.")
+            items.append(mk("DATA:nft", "CoinGecko", title, summary,
+                            f"https://www.coingecko.com/en/nft/{n.get('id', '')}#{day}-{way}-{int(abs(pct) // 25)}"))
+        n_coin = 0
+        for c in (j.get("coins") or [])[:15]:
+            it = c.get("item") or {}
+            d = it.get("data") or {}
+            pc = d.get("price_change_percentage_24h")
+            try:
+                pct = float(pc.get("usd") if isinstance(pc, dict) else pc)
+            except Exception:
+                continue
+            if abs(pct) < 8 or n_coin >= 5:
+                continue
+            n_coin += 1
+            way = "up" if pct > 0 else "down"
+            title = f"{it.get('name', 'Token')} (${str(it.get('symbol', '')).upper()}) trending, {way} {abs(pct):.0f}% in 24h"
+            summary = (f"CoinGecko trending token, market cap rank {it.get('market_cap_rank', 'n/a')}. Price {money(d.get('price'))}. "
+                       f"24h change {pct:+.1f}%. Market cap {d.get('market_cap', 'n/a')}. 24h volume {d.get('total_volume', 'n/a')}.")
+            items.append(mk("DATA:token", "CoinGecko", title, summary,
+                            f"https://www.coingecko.com/en/coins/{it.get('id', '')}#{day}-{way}-{int(abs(pct) // 15)}"))
+    except Exception as ex:
+        status["cg-trending"] = "error " + str(ex)[:40]
+    try:
+        r = cg_get("/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1&price_change_percentage=1h,24h")
+        status["cg-markets"] = "ok" if r.ok else "http " + str(r.status_code)
+        movers = []
+        for c in (r.json() if r.ok else []):
+            try:
+                pct = float(c.get("price_change_percentage_24h"))
+            except Exception:
+                continue
+            if abs(pct) >= 12 and (c.get("market_cap_rank") or 9999) <= 400:
+                movers.append((abs(pct), c, pct))
+        movers.sort(key=lambda x: -x[0])
+        for _, c, pct in movers[:5]:
+            way = "up" if pct > 0 else "down"
+            h1 = c.get("price_change_percentage_1h_in_currency")
+            title = f"{c.get('name')} (${str(c.get('symbol', '')).upper()}) {'jumps' if pct > 0 else 'drops'} {abs(pct):.0f}% in 24h to {money(c.get('current_price'))}"
+            summary = (f"CoinGecko market data. Price {money(c.get('current_price'))}. 24h change {pct:+.1f}%"
+                       + (f", 1h change {float(h1):+.1f}%" if h1 is not None else "")
+                       + f". 24h volume {big(c.get('total_volume'))}. Market cap {big(c.get('market_cap'))}, rank {c.get('market_cap_rank')}.")
+            items.append(mk("DATA:token", "CoinGecko", title, summary,
+                            f"https://www.coingecko.com/en/coins/{c.get('id', '')}#{day}-{way}-{int(abs(pct) // 12)}"))
+    except Exception as ex:
+        status["cg-markets"] = "error " + str(ex)[:40]
+    try:
+        addrs = {}
+        ok_any = False
+        for path in ("/token-boosts/top/v1", "/token-boosts/latest/v1", "/token-profiles/latest/v1"):
+            r = requests.get("https://api.dexscreener.com" + path, headers=UA, timeout=20)
+            if not r.ok:
+                continue
+            ok_any = True
+            for t in (r.json() or [])[:40]:
+                ch, ad = t.get("chainId"), t.get("tokenAddress")
+                if ch and ad and ad not in addrs.setdefault(ch, []):
+                    addrs[ch].append(ad)
+        status["dexscreener"] = "ok" if ok_any else "no data"
+        n_dex = 0
+        for ch, lst in list(addrs.items())[:5]:
+            r = requests.get(f"https://api.dexscreener.com/tokens/v1/{ch}/{','.join(lst[:30])}", headers=UA, timeout=20)
+            if not r.ok:
+                continue
+            best = {}
+            for p in r.json() or []:
+                key = (p.get("baseToken") or {}).get("address")
+                liq = (p.get("liquidity") or {}).get("usd") or 0
+                if key and liq >= (best.get(key, {}).get("liquidity") or {}).get("usd", 0):
+                    best[key] = p
+            for p in best.values():
+                liq = (p.get("liquidity") or {}).get("usd") or 0
+                vol = (p.get("volume") or {}).get("h24") or 0
+                pc = p.get("priceChange") or {}
+                h24, h1 = float(pc.get("h24") or 0), float(pc.get("h1") or 0)
+                created = p.get("pairCreatedAt")
+                age_h = (time.time() * 1000 - created) / 3.6e6 if created else None
+                new_token = age_h is not None and age_h < 24
+                if liq < 40000 or vol < 100000 or not (abs(h24) >= 40 or h1 >= 20 or new_token) or n_dex >= 10:
+                    continue
+                n_dex += 1
+                bt = p.get("baseToken") or {}
+                name, sym = bt.get("name", "Token"), str(bt.get("symbol", "")).upper()
+                way = "up" if h24 >= 0 else "down"
+                if new_token and abs(h24) < 40:
+                    title = f"New token {name} (${sym}) launches on {ch} with {big(liq)} liquidity"
+                else:
+                    title = f"{name} (${sym}) {'surges' if h24 >= 0 else 'plunges'} {abs(h24):.0f}% in 24h on {ch}"
+                summary = (f"DexScreener trending DEX token on {ch}. Price {money(p.get('priceUsd'))}. 24h change {h24:+.0f}%, 1h change {h1:+.0f}%. "
+                           f"24h volume {big(vol)}. Liquidity {big(liq)}. Market cap {big(p.get('marketCap') or p.get('fdv'))}. "
+                           + (f"Pair is {age_h:.0f} hours old. " if age_h is not None else "") + "High-risk small-cap DEX token.")
+                items.append(mk("DATA:meme", "DexScreener", title, summary,
+                                (p.get("url") or "https://dexscreener.com") + f"#{day}-{way}-{int(abs(h24) // 50)}"))
+    except Exception as ex:
+        status["dexscreener"] = "error " + str(ex)[:40]
+    return items, status
+
+def entry_ts(entry):
+    t = entry.get("published_parsed") or entry.get("updated_parsed")
+    return calendar.timegm(t) if t else time.time()
+
+def to_queue(c):
+    return {"feed": c["feed"], "source": c["source"], "title": c["title"], "link": c["link"], "summary": c["summary"][:500],
+            "cat": c.get("cat", "other"), "score": c.get("score", 0), "ts": entry_ts(c["entry"])}
+
+def from_queue(q):
+    cutoff = time.time() - 16 * 3600
+    out = []
+    for d in q:
+        try:
+            if d["ts"] >= cutoff:
+                out.append({"feed": d["feed"], "source": d["source"], "title": d["title"], "link": d["link"], "summary": d["summary"],
+                            "entry": {"published_parsed": time.gmtime(d["ts"])}, "score": d["score"], "cat": d["cat"], "dup": False})
+        except Exception:
+            continue
+    return out
+
+def select(items, rr):
+    """Fair pick: one story from each priority category in rotation, then the best general news, then the best of the rest."""
+    items = sorted(items, key=lambda c: (-c["score"], -entry_ts(c["entry"])))
+    buckets = {}
+    for c in items:
+        buckets.setdefault(c["cat"] if c["cat"] in PRIORITY else "general", []).append(c)
+    k = rr % len(PRIORITY)
+    order = PRIORITY[k:] + PRIORITY[:k]
+    chosen, per = [], {}
+    def take(c):
+        chosen.append(c)
+        key = c["cat"] if c["cat"] in PRIORITY else "general"
+        per[key] = per.get(key, 0) + 1
+        buckets[key].remove(c)
+    for cat in order:
+        if buckets.get(cat) and len(chosen) < MAX_DRAFTS:
+            take(buckets[cat][0])
+    for c in list(buckets.get("general", []))[:GENERAL_MAX]:
+        if len(chosen) < MAX_DRAFTS:
+            take(c)
+    rest = [c for c in items if c not in chosen]
+    for c in rest:
+        key = c["cat"] if c["cat"] in PRIORITY else "general"
+        if len(chosen) >= MAX_DRAFTS:
+            break
+        if per.get(key, 0) < (2 if key != "general" else GENERAL_MAX):
+            take(c)
+    return chosen
+
 def write_one(args):
     c, recent_objs = args
     try:
@@ -437,23 +657,31 @@ def main():
 
     st = load_state()
     seen = st["links"]
+    queued = from_queue(st["queue"])
+    queued_links = set(c["link"] for c in queued)
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(fetch_feed, FEEDS))
     failed = [r[0] for r in results if r[3] == "fail"]
     empty = [r[0] for r in results if r[3] == "empty"]
     pool, nft_items = build_pool(results, seen)
+    try:
+        dpool, dstatus = data_items()
+    except Exception as ex:
+        dpool, dstatus = [], {"data": "error " + str(ex)[:40]}
+    pool = pool + [d for d in dpool if d["link"] not in seen]
 
-    # balanced candidates: niche sources first (up to 2 each), then general sources (up to 3 each)
+    # balanced candidates: niche and data sources first, then general sources
     cands, skipped_dups, per = [], 0, {}
     for phase in (1, 2):
         for c in pool:
             if len(cands) >= MAX_CANDIDATES:
                 break
-            niche = is_niche(c["feed"])
-            if (phase == 1) != niche or c["link"] in seen or any(k is c for k in cands):
+            niche = is_niche(c["feed"]) or c["feed"].startswith("DATA:")
+            if (phase == 1) != niche or c["link"] in seen or c["link"] in queued_links or any(k is c for k in cands):
                 continue
-            if per.get(c["feed"], 0) >= (2 if niche else 3):
+            cap = 4 if c["feed"].startswith("DATA:") else (2 if niche else 3)
+            if per.get(c["feed"], 0) >= cap:
                 continue
             if any(similar(c["title"], t) for t in st["titles"]) or any(similar(c["title"], k["title"]) for k in cands):
                 seen.add(c["link"])
@@ -462,7 +690,8 @@ def main():
             per[c["feed"]] = per.get(c["feed"], 0) + 1
             cands.append(c)
 
-    drafts, picked, dups, scores, cats = 0, [], 0, [], {}
+    drafts, scores, dups = 0, [], 0
+    qualifying, scored_ok = [], True
     if cands:
         try:
             lines = [f"{i} | {c['source']} | {c['title']} | {c['summary'][:200]}" for i, c in enumerate(cands)]
@@ -473,8 +702,7 @@ def main():
             by_id = {int(r["id"]): r for r in res if isinstance(r, dict) and "id" in r}
         except Exception as ex:
             errors.append("Scoring failed: " + str(ex)[:120])
-            by_id = None
-
+            by_id, scored_ok = None, False
         if by_id is not None:
             for i, c in enumerate(cands):
                 r = by_id.get(i, {})
@@ -483,37 +711,34 @@ def main():
                 c["cat"] = str(r.get("cat", "other")).lower()
                 scores.append(c["score"])
                 dups += 1 if c["dup"] else 0
-            ok = sorted([c for c in cands if c["score"] >= MIN_SCORE and not c["dup"]], key=lambda c: -c["score"])
-            count = {}
-            for c in ok:
-                if count.get(c["cat"], 0) >= CAT_CAP:
-                    continue
-                picked.append(c)
-                count[c["cat"]] = count.get(c["cat"], 0) + 1
-                cats[c["cat"]] = cats.get(c["cat"], 0) + 1
-                if len(picked) >= MAX_DRAFTS:
-                    break
-            unsent = set(c["link"] for c in picked)
-            with ThreadPoolExecutor(max_workers=3) as ex:
-                written = list(ex.map(write_one, [(c, list(st["objs"])) for c in picked]))
-            fails = 0
-            for c, out, err in written:
-                if err is not None or not out:
-                    errors.append(str(err)[:120])
-                    fails += 1
-                    continue
-                post, g, png = build_post(out, st)
-                if deliver(post, mm_time(c["entry"]), png, c["link"], f"Source ({c['score']}/10)"):
-                    drafts += 1
-                    unsent.discard(c["link"])
-                    st["sent"].append(str(g.get("headline") or c["title"]))
-                time.sleep(1)
-            if fails >= 2:
-                errors.append("Gemini busy for some stories. Will retry next run.")
-            for c in cands:
-                if c["link"] not in unsent:
-                    seen.add(c["link"])
-                    st["titles"].append(c["title"])
+                seen.add(c["link"])
+                st["titles"].append(c["title"])
+                if c["score"] >= MIN_SCORE and not c["dup"]:
+                    qualifying.append(c)
+
+    # new qualifying stories join the queue of stories that did not fit in earlier runs
+    pool_all = queued + qualifying
+    picked = select(pool_all, st["rr"]) if scored_ok else []
+    st["rr"] += 1
+    cats = {}
+    for c in picked:
+        cats[c["cat"]] = cats.get(c["cat"], 0) + 1
+
+    left = {c["link"]: c for c in pool_all}
+    if picked:
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            written = list(ex.map(write_one, [(c, list(st["objs"])) for c in picked]))
+        for c, out, err in written:
+            if err is not None or not out:
+                errors.append(str(err)[:120])
+                continue
+            post, g, png = build_post(out, st)
+            if deliver(post, mm_time(c["entry"]), png, c["link"], f"Source ({c['score']}/10)"):
+                drafts += 1
+                left.pop(c["link"], None)
+                st["sent"].append(str(g.get("headline") or c["title"]))
+            time.sleep(1)
+    st["queue"] = [to_queue(c) for c in sorted(left.values(), key=lambda c: -c["score"])[:60]]
 
     minted = daily_mints(st, nft_items)
     save_state(st)
@@ -521,8 +746,8 @@ def main():
     if MANUAL:
         send(
             f"Run done. Feeds failed: {', '.join(failed) if failed else 'none'}. Empty: {', '.join(empty) if empty else 'none'}. "
-            f"New stories: {len(pool)}. Scored: {len(scores)}. Duplicates skipped: {skipped_dups + dups}. "
-            f"Scores: {scores}. Sent: {drafts} {cats}. Mint list: {minted}. Errors: {errors[:3] if errors else 'none'}"
+            f"Data: {dstatus}, {len(dpool)} items. New stories: {len(pool)}. Scored: {len(scores)}. Duplicates skipped: {skipped_dups + dups}. "
+            f"Sent: {drafts} {cats}. Waiting in queue: {len(st['queue'])}. Mint list: {minted}. Errors: {errors[:3] if errors else 'none'}"
         )
 
 main()
